@@ -20,6 +20,7 @@ import 'vs/css!./media/testing';
 import { ICodeEditor } from 'vs/editor/browser/editorBrowser';
 import { ICodeEditorService } from 'vs/editor/browser/services/codeEditorService';
 import { Position } from 'vs/editor/common/core/position';
+import { Location as ModeLocation } from 'vs/editor/common/modes';
 import { localize } from 'vs/nls';
 import { MenuEntryActionViewItem } from 'vs/platform/actions/browser/menuEntryActionViewItem';
 import { MenuItemAction } from 'vs/platform/actions/common/actions';
@@ -44,10 +45,10 @@ import { ViewPane } from 'vs/workbench/browser/parts/views/viewPane';
 import { IViewletViewOptions } from 'vs/workbench/browser/parts/views/viewsViewlet';
 import { IViewDescriptorService } from 'vs/workbench/common/views';
 import { testingStatesToIcons } from 'vs/workbench/contrib/testing/browser/icons';
-import { maxPriority, statePriority } from 'vs/workbench/contrib/testing/browser/testExplorerTree';
+import { cmpPriority, maxPriority, statePriority, statesInOrder } from 'vs/workbench/contrib/testing/browser/testExplorerTree';
 import { ITestingCollectionService, TestSubscriptionListener } from 'vs/workbench/contrib/testing/browser/testingCollectionService';
-import { TestExplorerViewMode } from 'vs/workbench/contrib/testing/common/constants';
-import { InternalTestItem, TestDiffOpType, TestsDiff } from 'vs/workbench/contrib/testing/common/testCollection';
+import { TestExplorerViewGrouping, TestExplorerViewMode, testStateNames } from 'vs/workbench/contrib/testing/common/constants';
+import { AbstractIncrementalTestCollection, IncrementalChangeCollector, IncrementalTestCollectionItem, InternalTestItem, TestDiffOpType, TestIdWithProvider, TestsDiff } from 'vs/workbench/contrib/testing/common/testCollection';
 import { TestingContextKeys } from 'vs/workbench/contrib/testing/common/testingContextKeys';
 import { ITestService } from 'vs/workbench/contrib/testing/common/testService';
 import { IEditorService } from 'vs/workbench/services/editor/common/editorService';
@@ -147,12 +148,7 @@ export class TestingExplorerViewModel extends Disposable {
 	public projection!: ITestTreeProjection;
 
 	private readonly _viewMode = TestingContextKeys.viewMode.bindTo(this.contextKeyService);
-	private viewModeChangeEmitter = new Emitter<TestExplorerViewMode>();
-
-	/**
-	 * Fires when the tree view mode changes.
-	 */
-	public readonly onViewModeChange = this.viewModeChangeEmitter.event;
+	private readonly _viewGrouping = TestingContextKeys.viewGrouping.bindTo(this.contextKeyService);
 
 	/**
 	 * Fires when the selected tests change.
@@ -171,7 +167,21 @@ export class TestingExplorerViewModel extends Disposable {
 		this._viewMode.set(newMode);
 		this.updatePreferredProjection();
 		this.storageService.store('testing.viewMode', newMode, StorageScope.WORKSPACE, StorageTarget.USER);
-		this.viewModeChangeEmitter.fire(newMode);
+	}
+
+
+	public get viewGrouping() {
+		return this._viewGrouping.get() ?? TestExplorerViewGrouping.ByLocation;
+	}
+
+	public set viewGrouping(newGrouping: TestExplorerViewGrouping) {
+		if (newGrouping === this._viewGrouping.get()) {
+			return;
+		}
+
+		this._viewGrouping.set(newGrouping);
+		this.updatePreferredProjection();
+		this.storageService.store('testing.viewGrouping', newGrouping, StorageScope.WORKSPACE, StorageTarget.USER);
 	}
 
 	constructor(
@@ -187,6 +197,8 @@ export class TestingExplorerViewModel extends Disposable {
 		super();
 
 		this._viewMode.set(this.storageService.get('testing.viewMode', StorageScope.WORKSPACE, TestExplorerViewMode.Tree) as TestExplorerViewMode);
+		this._viewGrouping.set(this.storageService.get('testing.viewGrouping', StorageScope.WORKSPACE, TestExplorerViewGrouping.ByLocation) as TestExplorerViewGrouping);
+
 		const labels = this._register(instantiationService.createInstance(ResourceLabels, { onDidChangeVisibility: onDidChangeVisibility }));
 
 		this.filter = new TestsFilter();
@@ -281,10 +293,18 @@ export class TestingExplorerViewModel extends Disposable {
 			return;
 		}
 
-		if (this._viewMode.get() === TestExplorerViewMode.List) {
-			this.projection = new ListProjection(this.listener);
+		if (this._viewGrouping.get() === TestExplorerViewGrouping.ByLocation) {
+			if (this._viewMode.get() === TestExplorerViewMode.List) {
+				this.projection = new ListProjection(this.listener);
+			} else {
+				this.projection = new HierarchalProjection(this.listener);
+			}
 		} else {
-			this.projection = new HierarchalProjection(this.listener);
+			if (this._viewMode.get() === TestExplorerViewMode.List) {
+				this.projection = new StatusListProjection(this.listener);
+			} else {
+				this.projection = new StatusProjection(this.listener);
+			}
 		}
 
 		this.projection.onUpdate(this.deferUpdate, this);
@@ -425,6 +445,10 @@ class TestsFilter implements ITreeFilter<ITestTreeElement, FuzzyScore> {
 			return TreeVisibility.Hidden;
 		}
 
+		if (element instanceof ListStateElement && element.elementType !== ListElementType.TestLeaf) {
+			return TreeVisibility.Hidden;
+		}
+
 		if (!this.filterText) {
 			return TreeVisibility.Visible;
 		}
@@ -438,6 +462,10 @@ class TestsFilter implements ITreeFilter<ITestTreeElement, FuzzyScore> {
 }
 class TreeSorter implements ITreeSorter<ITestTreeElement> {
 	public compare(a: ITestTreeElement, b: ITestTreeElement): number {
+		if (a instanceof StateElement && b instanceof StateElement) {
+			return cmpPriority(a.computedState, b.computedState);
+		}
+
 		return a.label.localeCompare(b.label);
 	}
 }
@@ -531,17 +559,24 @@ class TestsRenderer implements ITreeRenderer<ITestTreeElement, FuzzyScore, TestT
 			options.title = 'hover title';
 			options.fileKind = FileKind.FILE;
 
-			if (test.item.runnable) {
-				data.actionBar.push(this.instantiationService.createInstance(RunAction, test), { icon: true, label: false });
-			}
-
-			if (test.item.debuggable) {
-				data.actionBar.push(this.instantiationService.createInstance(DebugAction, test), { icon: true, label: false });
-			}
-
 			label.description = element.description;
 		} else {
 			options.fileKind = FileKind.ROOT_FOLDER;
+		}
+
+		const running = state === TestRunState.Running;
+		if (!Iterable.isEmpty(element.runnable)) {
+			data.actionBar.push(
+				this.instantiationService.createInstance(RunAction, element.runnable, running),
+				{ icon: true, label: false },
+			);
+		}
+
+		if (!Iterable.isEmpty(element.debuggable)) {
+			data.actionBar.push(
+				this.instantiationService.createInstance(DebugAction, element.debuggable, running),
+				{ icon: true, label: false },
+			);
 		}
 
 		data.label.setResource(label, options);
@@ -606,6 +641,16 @@ export interface ITestTreeElement {
 	readonly depth: number;
 
 	/**
+	 * Tests that can be run using this tree item.
+	 */
+	readonly runnable: Iterable<TestIdWithProvider>;
+
+	/**
+	 * Tests that can be run using this tree item.
+	 */
+	readonly debuggable: Iterable<TestIdWithProvider>;
+
+	/**
 	 * State of of the tree item. Mostly used for deriving the computed state.
 	 */
 	readonly state?: TestRunState;
@@ -635,6 +680,14 @@ class HierarchalElement implements ITestTreeElement {
 		return this.test.item.location;
 	}
 
+	public get runnable() {
+		return this.test.item.runnable ? [this.test.item] : Iterable.empty();
+	}
+
+	public get debuggable() {
+		return this.test.item.debuggable ? [this.test.item] : Iterable.empty();
+	}
+
 	constructor(public readonly test: InternalTestItem, public readonly parentItem: HierarchalFolder | HierarchalElement) {
 		this.test = { ...test, item: { ...test.item } }; // clone since we Object.assign updatese
 	}
@@ -660,6 +713,14 @@ class HierarchalFolder implements ITestTreeElement {
 
 	public get treeId() {
 		return `folder:${this.folder.index}`;
+	}
+
+	public get runnable() {
+		return Iterable.concatNested(Iterable.map(this.children, c => c.runnable));
+	}
+
+	public get debuggable() {
+		return Iterable.concatNested(Iterable.map(this.children, c => c.debuggable));
 	}
 
 	constructor(private readonly folder: IWorkspaceFolder) { }
@@ -759,6 +820,76 @@ class ListElement extends HierarchalElement {
 }
 
 /**
+ * Stores and looks up items by their uri/range.
+ */
+class TestLocationStore<T extends { location?: ModeLocation, depth: number }> {
+	private readonly itemsByUri = new Map<string, T[]>();
+
+	public getTestAtPosition(uri: URI, position: Position) {
+		const tests = this.itemsByUri.get(uri.toString());
+		if (!tests) {
+			return;
+		}
+
+		return tests.find(test => {
+			const range = test.location?.range;
+			return range
+				&& new Position(range.startLineNumber, range.startColumn).isBeforeOrEqual(position)
+				&& position.isBefore(new Position(
+					range.endLineNumber ?? range.startLineNumber,
+					range.endColumn ?? range.startColumn,
+				));
+		});
+	}
+
+	public remove(item: T, fromLocation = item.location) {
+		if (!fromLocation) {
+			return;
+		}
+
+		const key = fromLocation.uri.toString();
+		const arr = this.itemsByUri.get(key);
+		if (!arr) {
+			return;
+		}
+
+		for (let i = 0; i < arr.length; i++) {
+			if (arr[i] === item) {
+				arr.splice(i, 1);
+				return;
+			}
+		}
+	}
+
+	public add(item: T) {
+		if (!item.location) {
+			return;
+		}
+
+		const key = item.location.uri.toString();
+		const arr = this.itemsByUri.get(key);
+		if (!arr) {
+			this.itemsByUri.set(key, [item]);
+			return;
+		}
+
+		arr.splice(findFirstInSorted(arr, x => x.depth < item.depth), 0, item);
+	}
+}
+
+const locationsEqual = (a: ModeLocation | undefined, b: ModeLocation | undefined) => {
+	if (a === undefined || b === undefined) {
+		return b === a;
+	}
+
+	return a.uri.toString() === b.uri.toString()
+		&& a.range.startLineNumber === b.range.startLineNumber
+		&& a.range.startColumn === b.range.startColumn
+		&& a.range.endLineNumber === b.range.endLineNumber
+		&& a.range.endColumn === b.range.endColumn;
+};
+
+/**
  * Projection that lists tests in their traditional tree view.
  */
 class HierarchalProjection extends Disposable implements ITestTreeProjection {
@@ -767,7 +898,7 @@ class HierarchalProjection extends Disposable implements ITestTreeProjection {
 	private newlyRenderedNodes = new Set<HierarchalElement | HierarchalFolder>();
 	private updatedNodes = new Set<HierarchalElement | HierarchalFolder>();
 	private removedNodes = new Set<HierarchalElement | HierarchalFolder>();
-	private readonly itemsByUri = new Map<string, HierarchalElement[]>();
+	private readonly locations = new TestLocationStore<HierarchalElement>();
 
 	/**
 	 * Map of item IDs to test item objects.
@@ -821,18 +952,7 @@ class HierarchalProjection extends Disposable implements ITestTreeProjection {
 	 * @inheritdoc
 	 */
 	public getTestAtPosition(uri: URI, position: Position) {
-		const tests = this.itemsByUri.get(uri.toString());
-		if (!tests) {
-			return;
-		}
-
-
-		return tests.find(test => {
-			const range = test.location?.range;
-			return range
-				&& new Position(range.startLineNumber, range.startColumn).isBeforeOrEqual(position)
-				&& position.isBefore(new Position(range.endLineNumber, range.endColumn));
-		});
+		return this.locations.getTestAtPosition(uri, position);
 	}
 
 	/**
@@ -855,10 +975,10 @@ class HierarchalProjection extends Disposable implements ITestTreeProjection {
 						break;
 					}
 
-					const locationChanged = existing.location?.uri.toString() !== item.item.location?.uri.toString();
-					if (locationChanged) { this.removeItemFromLocationMap(existing); }
+					const locationChanged = !locationsEqual(existing.location, item.item.location);
+					if (locationChanged) { this.locations.remove(existing); }
 					existing.update(item, this.addUpdated);
-					if (locationChanged) { this.addItemToLocationMap(existing); }
+					if (locationChanged) { this.locations.add(existing); }
 					this.addUpdated(existing);
 					break;
 				}
@@ -934,7 +1054,9 @@ class HierarchalProjection extends Disposable implements ITestTreeProjection {
 			}
 
 			for (const node of this.updatedNodes) {
-				tree.rerender(node);
+				if (!alreadyUpdatedChildren.has(node)) {
+					tree.rerender(node);
+				}
 			}
 		}
 
@@ -979,47 +1101,13 @@ class HierarchalProjection extends Disposable implements ITestTreeProjection {
 
 	private unstoreItem(item: HierarchalElement) {
 		this.items.delete(item.test.id);
-		this.removeItemFromLocationMap(item);
+		this.locations.add(item);
 	}
 
 	protected storeItem(item: HierarchalElement) {
 		item.parentItem.children.add(item);
 		this.items.set(item.test.id, item);
-		this.addItemToLocationMap(item);
-	}
-
-	protected removeItemFromLocationMap(item: HierarchalElement) {
-		if (!item.location) {
-			return;
-		}
-
-		const key = item.location.uri.toString();
-		const arr = this.itemsByUri.get(key);
-		if (!arr) {
-			return;
-		}
-
-		for (let i = 0; i < arr.length; i++) {
-			if (arr[i] === item) {
-				arr.splice(i, 1);
-				return;
-			}
-		}
-	}
-
-	protected addItemToLocationMap(item: HierarchalElement) {
-		if (!item.location) {
-			return;
-		}
-
-		const key = item.location.uri.toString();
-		const arr = this.itemsByUri.get(key);
-		if (!arr) {
-			this.itemsByUri.set(key, [item]);
-			return;
-		}
-
-		arr.splice(findFirstInSorted(arr, x => x.depth < item.depth), 0, item);
+		this.locations.remove(item);
 	}
 }
 
@@ -1049,5 +1137,427 @@ class ListProjection extends HierarchalProjection {
 	 */
 	protected deleteItem(item: HierarchalElement) {
 		(item as ListElement).remove();
+	}
+}
+
+class StateElement implements ITestTreeElement {
+	public computedState = this.state;
+
+	public get treeId() {
+		return `state:${this.state}`;
+	}
+
+	public readonly depth = 0;
+	public readonly label = testStateNames[this.state];
+	public readonly parentItem = null;
+	public readonly children = new Set<TestStateElement>();
+
+	getChildren(): Iterable<ITestTreeElement> {
+		return this.children;
+	}
+
+	public get runnable() {
+		return Iterable.concatNested(Iterable.map(this.children, c => c.runnable));
+	}
+
+	public get debuggable() {
+		return Iterable.concatNested(Iterable.map(this.children, c => c.debuggable));
+	}
+
+	constructor(public readonly state: TestRunState) { }
+}
+
+class TestStateElement implements ITestTreeElement {
+	public computedState = this.state;
+
+	public get treeId() {
+		return `test:${this.test.id}`;
+	}
+
+	public get label() {
+		return this.test.item.label;
+	}
+
+	public get location() {
+		return this.test.item.location;
+	}
+
+	public get runnable(): Iterable<TestIdWithProvider> {
+		// if this item is runnable and all its children are in the same state,
+		// we can run all of them in one go. This will eventually be true
+		// for leaf nodes, whose treeElements contain only their own state.
+		if (this.test.item.runnable && this.test.treeElements.size === 1) {
+			return [{ testId: this.test.id, providerId: this.test.providerId }];
+		}
+
+		return Iterable.concatNested(Iterable.map(this.children, c => c.runnable));
+	}
+
+	public get debuggable(): Iterable<TestIdWithProvider> {
+		// same logic as runnable above
+		if (this.test.item.debuggable && this.test.treeElements.size === 1) {
+			return [{ testId: this.test.id, providerId: this.test.providerId }];
+		}
+
+		return Iterable.concatNested(Iterable.map(this.children, c => c.debuggable));
+	}
+
+	public readonly depth = 0;
+	public readonly children = new Set<TestStateElement>();
+
+	getChildren(): Iterable<ITestTreeElement> {
+		return this.children;
+	}
+
+	constructor(
+		public readonly state: TestRunState,
+		public readonly test: IStatusTestItem,
+		public readonly parentItem: TestStateElement | StateElement,
+	) {
+		parentItem.children.add(this);
+	}
+
+	public remove() {
+		this.parentItem.children.delete(this);
+	}
+}
+
+class ListStateElement extends TestStateElement {
+	public elementType: ListElementType = ListElementType.Unset;
+	public readonly children = new Set<ListStateElement>();
+
+	constructor(
+		state: TestRunState,
+		test: IStatusTestItem,
+		parentItem: StateElement,
+		private readonly addUpdated: (n: ListStateElement) => void,
+		private readonly actualParent?: ListStateElement,
+	) {
+		super(state, test, parentItem);
+		actualParent?.addChild(this);
+		this.updateLeafTestState();
+	}
+
+	/**
+	 * Should be called when the list element is removed.
+	 */
+	public remove() {
+		super.remove();
+		this.actualParent?.removeChild(this);
+	}
+
+	public removeChild(element: ListStateElement) {
+		this.children.delete(element);
+		this.updateLeafTestState();
+	}
+
+	public addChild(element: ListStateElement) {
+		this.children.add(element);
+		this.updateLeafTestState();
+	}
+
+	/**
+	 * Updates the test leaf state for this node. Should be called when a child
+	 * or this node is modified. Note that we never need to look at the children
+	 * here, the children will already be leaves, or not.
+	 */
+	private updateLeafTestState() {
+		const oldType = this.elementType;
+		const newType = Iterable.some(this.children, c => oldType !== ListElementType.BranchWithoutLeaf)
+			? ListElementType.BranchWithLeaf
+			: this.test.item.runnable
+				? ListElementType.TestLeaf
+				: ListElementType.BranchWithoutLeaf;
+
+		if (newType !== this.elementType) {
+			this.elementType = newType;
+			if (oldType !== ListElementType.Unset) {
+				this.addUpdated(this);
+			}
+		}
+
+		this.actualParent?.updateLeafTestState();
+	}
+}
+
+interface IStatusTestItem extends IncrementalTestCollectionItem {
+	treeElements: Map<TestRunState, TestStateElement>;
+	previousState: TestRunState;
+	depth: number;
+	parentItem?: IStatusTestItem;
+	location?: ModeLocation;
+}
+
+class StatusProjection extends AbstractIncrementalTestCollection<IStatusTestItem> implements ITestTreeProjection {
+	private readonly updateEmitter = new Emitter<void>();
+	protected newlyRenderedNodes = new Set<StateElement | TestStateElement>();
+	private updatedNodes = new Set<StateElement | TestStateElement>();
+	protected removedNodes = new Set<StateElement | TestStateElement>();
+	private readonly locations = new TestLocationStore<IStatusTestItem>();
+	private readonly disposable = new DisposableStore();
+
+	/**
+	 * @inheritdoc
+	 */
+	public readonly onUpdate = this.updateEmitter.event;
+
+	/**
+	 * Root elements for states in the tree.
+	 */
+	protected readonly stateRoots = new Map<TestRunState, StateElement>();
+
+	constructor(listener: TestSubscriptionListener) {
+		super();
+
+		this.disposable.add(listener.onDiff(([, diff]) => this.apply(diff)));
+
+		const firstDiff: TestsDiff = [];
+		for (const [, collection] of listener.workspaceFolderCollections) {
+			const queue = [collection.rootNodes];
+			while (queue.length) {
+				for (const id of queue.pop()!) {
+					const node = collection.getNodeById(id)!;
+					firstDiff.push([TestDiffOpType.Add, node]);
+					queue.push(node.children);
+				}
+			}
+		}
+
+		this.apply(firstDiff);
+	}
+
+	/**
+	 * Frees listeners associated with the projection.
+	 */
+	public dispose() {
+		this.disposable.dispose();
+	}
+
+	/**
+	 * @inheritdoc
+	 */
+	public getTestAtPosition(uri: URI, position: Position) {
+		const item = this.locations.getTestAtPosition(uri, position);
+		if (!item) {
+			return undefined;
+		}
+
+		for (const state of statesInOrder) {
+			const element = item.treeElements.get(state);
+			if (element) {
+				return element;
+			}
+		}
+
+		return undefined;
+	}
+
+	/**
+	 * @inheritdoc
+	 */
+	public applyTo(tree: ObjectTree<ITestTreeElement, FuzzyScore>) {
+		const alreadyUpdatedChildren = new Set<StateElement | TestStateElement | null>();
+		for (const nodeList of [this.newlyRenderedNodes, this.removedNodes]) {
+			for (let { parentItem, children } of nodeList) {
+				if (!alreadyUpdatedChildren.has(parentItem)) {
+					const pchildren: Iterable<StateElement | TestStateElement> = parentItem?.children ?? this.stateRoots.values();
+					tree.setChildren(parentItem, Iterable.map(pchildren, this.renderNode));
+
+					alreadyUpdatedChildren.add(parentItem);
+				}
+
+				for (const child of children) {
+					alreadyUpdatedChildren.add(child);
+				}
+			}
+		}
+
+		for (const node of this.updatedNodes) {
+			if (!alreadyUpdatedChildren.has(node)) {
+				tree.rerender(node);
+			}
+		}
+
+		this.newlyRenderedNodes.clear();
+		this.removedNodes.clear();
+		this.updatedNodes.clear();
+	}
+
+	protected readonly addUpdated = (node: StateElement | TestStateElement) => {
+		if (!this.newlyRenderedNodes.has(node)) {
+			this.updatedNodes.add(node);
+		}
+	};
+
+	private readonly renderNode = (node: StateElement | TestStateElement): ITreeElement<ITestTreeElement> => {
+		return {
+			element: node,
+			children: Iterable.map(node.children, this.renderNode),
+		};
+	};
+
+	/**
+	 * @override
+	 */
+	protected createChangeCollector(): IncrementalChangeCollector<IStatusTestItem> {
+		return {
+			add: node => {
+				this.resolveNodesRecursive(node);
+				this.locations.add(node);
+			},
+			remove: (node, isNested) => {
+				this.locations.remove(node);
+
+				if (!isNested) {
+					for (const state of node.treeElements.keys()) {
+						this.pruneStateElements(node, state, true);
+					}
+				}
+			},
+			update: node => {
+				if (node.item.state.runState !== node.previousState) {
+					this.pruneStateElements(node, node.previousState);
+					this.resolveNodesRecursive(node);
+				}
+
+				const locationChanged = !locationsEqual(node.location, node.item.location);
+				if (locationChanged) {
+					this.locations.remove(node);
+					node.location = node.item.location;
+					this.locations.add(node);
+				}
+
+				this.addUpdated(node.treeElements.get(node.item.state.runState)!);
+			},
+			complete: () => {
+				this.updateEmitter.fire();
+			}
+		};
+	}
+
+	/**
+	 * Ensures tree nodes for the item state are present in the tree.
+	 */
+	protected resolveNodesRecursive(item: IStatusTestItem) {
+		const state = item.item.state.runState;
+		item.previousState = item.item.state.runState;
+
+		// Create a list of items until the current item who don't have a tree node for the status yet
+		let chain: IStatusTestItem[] = [];
+		for (let i: IStatusTestItem | undefined = item; i && !i.treeElements.has(state); i = i.parentItem) {
+			chain.push(i);
+		}
+
+		for (let i = chain.length - 1; i >= 0; i--) {
+			const item2 = chain[i];
+			// the loop would have stopped pushing parents when either it reaches
+			// the root, or it reaches a parent who already has a node for this state.
+			const parent = item2.parentItem?.treeElements.get(state) ?? this.getOrCreateStateElement(state);
+			const node = this.createElement(state, item2, parent);
+
+			item2.treeElements.set(state, node);
+			parent.children.add(node);
+
+			if (i === chain.length - 1) {
+				this.newlyRenderedNodes.add(node);
+			}
+		}
+	}
+
+	protected createElement(state: TestRunState, item: IStatusTestItem, parent: TestStateElement | StateElement) {
+		return new TestStateElement(state, item, parent);
+	}
+
+
+	/**
+	 * Recursively (from the leaf to the root) removes tree elements if there's
+	 * no children who have the given state left.
+	 *
+	 * Returns true if it resulted in a node being removed.
+	 */
+	protected pruneStateElements(item: IStatusTestItem | undefined, state: TestRunState, force = false) {
+		if (!item) {
+			const stateRoot = this.stateRoots.get(state);
+			if (stateRoot?.children.size === 0) {
+				this.removedNodes.add(stateRoot);
+				this.stateRoots.delete(state);
+				return true;
+			}
+
+			return false;
+		}
+
+		const node = item.treeElements.get(state);
+		if (!node) {
+			return false;
+		}
+
+		// Check to make sure we aren't in the state, and there's no child with the state...
+		if (!force) {
+			if (item.item.state.runState === state) {
+				return false;
+			}
+
+			for (const childId of item.children) {
+				if (this.items.get(childId)?.treeElements.has(state)) {
+					return false;
+				}
+			}
+		}
+
+		// If so, proceed to deletion and recurse upwards.
+		item.treeElements.delete(state);
+		node.remove();
+
+		if (!this.pruneStateElements(item.parentItem, state)) {
+			this.removedNodes.add(node);
+		}
+
+		return true;
+	}
+
+	protected getOrCreateStateElement(state: TestRunState) {
+		let s = this.stateRoots.get(state);
+		if (!s) {
+			s = new StateElement(state);
+			this.newlyRenderedNodes.add(s);
+			this.stateRoots.set(state, s);
+		}
+
+		return s;
+	}
+
+	protected createItem(item: InternalTestItem, parentItem?: IStatusTestItem): IStatusTestItem {
+		return {
+			...item,
+			depth: parentItem ? parentItem.depth + 1 : 0,
+			parentItem: parentItem,
+			previousState: item.item.state.runState,
+			location: item.item.location,
+			children: new Set(),
+			treeElements: new Map(),
+		};
+	}
+}
+
+/**
+ * Projection that shows tests in a flat list (grouped by status). The only
+ * change is that, while creating the item, the item parent is set to the
+ * state root.
+ *
+ * Note that if we didn't have the status projection, the implementation of
+ * this alone would be a lot simpler. But we may as well reuse it here.
+ */
+class StatusListProjection extends StatusProjection {
+	/**
+	 * @override
+	 */
+	protected createElement(state: TestRunState, item: IStatusTestItem, parent: TestStateElement | StateElement) {
+		return new ListStateElement(state,
+			item,
+			this.getOrCreateStateElement(state),
+			this.addUpdated,
+			parent instanceof ListStateElement ? parent : undefined,
+		);
 	}
 }
